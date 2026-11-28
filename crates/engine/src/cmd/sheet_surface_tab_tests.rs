@@ -396,3 +396,39 @@ fn a_gap_tab_to_the_far_side_past_the_bends_end_is_refused_as_past_it() {
         refused(&mut s, json!({"sketch": name}), solidcraft_doc::sheet::TAB_PAST_BEND);
     }
 }
+
+/// A rectangle sketch named `name` on the plane x = 100 (y and z its axes), from y0 to y1 and z0
+/// to z1.
+fn end_rectangle(s: &mut Session, name: &str, (y0, y1): (f64, f64), (z0, z1): (f64, f64)) {
+    run(s, "sketch.create", json!({"plane": {"origin": [100, 0, 0], "x_dir": [0, 1, 0], "y_dir": [0, 0, 1]}, "name": name}));
+    run(s, "sketch.line", json!({"points": [[y0, z0], [y1, z0], [y1, z1], [y0, z1]], "closed": true}));
+    run(s, "sketch.finish", json!({}));
+}
+
+/// Issue #23742's part: a 1.6 mm rule (R 1, K 0.48), a 110 x 60 plate with a 10 x 50 notch out
+/// of its x = 110 end, a 40 mm wall on its y = 0 edge, a 40 mm panel at 45 degrees on the wall's
+/// top leaning in over the plate, and a 30 mm end wall on the notch's x = 100 edge, under the
+/// slanted panel. A tab on the end wall's face up past its top, at y 15..28, stays under the
+/// slanted panel's metal, whose inner face is at z 52.737 over y = 15: it builds up to z 52.7,
+/// though the slanted panel's box holds it; past the metal, at 52.8, it is refused.
+#[test]
+fn a_tab_under_a_slanted_panel_builds_and_one_into_its_metal_is_refused() {
+    let mut s = Session::default();
+    run(&mut s, "sheet.manage_rules", json!({"name": "R", "thickness": "1.6 mm", "bend_radius": "1 mm", "k_factor": 0.48, "active": true}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Base"}));
+    run(&mut s, "sketch.line", json!({"points": [[0, 0], [110, 0], [110, 10], [100, 10], [100, 60], [0, 60]], "closed": true}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "sheet.flange", json!({"sketch": "Base"}));
+    run(&mut s, "sheet.flange", json!({"edges": [[50, 0, 0]], "height": "40 mm", "angle": "90 deg", "position": "inside", "flip": true}));
+    run(&mut s, "sheet.flange", json!({"edges": [[50, 0.8, 40]], "height": "40 mm", "angle": "45 deg", "position": "inside"}));
+    run(&mut s, "sheet.flange", json!({"edges": [[100, 35, 0]], "height": "30 mm", "angle": "90 deg", "position": "inside", "flip": true}));
+    let before = volume(&mut s);
+    end_rectangle(&mut s, "Into", (15.0, 28.0), (25.0, 52.8));
+    refused(&mut s, json!({"sketch": "Into"}), solidcraft_doc::sheet::TAB_OVERLAPS);
+    end_rectangle(&mut s, "Under", (15.0, 28.0), (25.0, 52.7));
+    let r = run(&mut s, "sheet.tab", json!({"sketch": "Under"}));
+    assert_eq!(r["changed_bodies"], json!(["Body1"]));
+    assert!((volume(&mut s) - before - 13.0 * 22.7 * 1.6).abs() < 1e-3, "{}", volume(&mut s) - before);
+    assert!(contains(&s, [99.2, 20.0, 52.0]));
+    assert_eq!(flat(&mut s)["outline"].as_array().map(Vec::len), Some(1));
+}

@@ -2764,14 +2764,16 @@ impl SurfaceSheet {
             Some(crate::sheet_surface::Piece::Panel(i)) => Some(i),
             _ => None,
         };
-        Some((panels, boxes.into_iter().map(|(piece, b)| (own(piece), b)).collect()))
+        Some((panels, boxes.into_iter().map(|(piece, b, _)| (own(piece), b)).collect()))
     }
 
-    /// [`Self::pieces_in_space`], with each box's piece of the flat (`None` for a loose piece).
+    /// [`Self::pieces_in_space`], with each box's piece of the flat (`None` for a loose piece) and,
+    /// for a piece that lies flat on a plane (a flat panel's material, a piece of zone riding with
+    /// one, a loose piece), its slab: the frame it lies in and its material in that frame's chart.
     #[allow(clippy::type_complexity)]
     pub(crate) fn piece_boxes_in_space(
         &self,
-    ) -> Option<(Vec<(usize, Rigid3, Region2)>, Vec<(Option<crate::sheet_surface::Piece>, solidcraft_geom::Aabb3)>)> {
+    ) -> Option<(Vec<(usize, Rigid3, Region2)>, Vec<(Option<crate::sheet_surface::Piece>, solidcraft_geom::Aabb3, Option<(Rigid3, Region2)>)>)> {
         let dev = self.develop().ok()?;
         let frames = crate::sheet_surface_cuts::frames(self, &dev).ok()?;
         let fold = if self.unfolded { None } else { Some(crate::sheet_surface_convert::fold_onto(&self.sheet, &dev, &self.places).ok()?) };
@@ -2793,8 +2795,9 @@ impl SurfaceSheet {
                 crate::sheet_surface::Piece::Panel(i) | crate::sheet_surface::Piece::Tab(_, i) => {
                     let (Some(frame), Some(Some(at))) = (frames.get(i).copied().flatten(), dev.placements.get(i)) else { return None };
                     let own = at.inverse().region(region);
-                    boxes.push((Some(*piece), slab(&frame, &own)));
-                    if matches!(piece, crate::sheet_surface::Piece::Panel(_)) && matches!(self.sheet.panels.get(i)?.surface, Surface::Plane) {
+                    let flat = matches!(self.sheet.panels.get(i)?.surface, Surface::Plane);
+                    boxes.push((Some(*piece), slab(&frame, &own), flat.then(|| (frame, own.clone()))));
+                    if matches!(piece, crate::sheet_surface::Piece::Panel(_)) && flat {
                         panels.push((i, frame, own));
                     }
                 }
@@ -2806,13 +2809,13 @@ impl SurfaceSheet {
                         Some(fold) => bent_box(&fold.bends.get(zone.joint).copied().flatten()?, region, t),
                         None => slab(&self.flat, region),
                     };
-                    boxes.push((Some(*piece), b));
+                    boxes.push((Some(*piece), b, None));
                 }
             }
         }
         for l in &self.loose {
             let frame = frames.get(l.panel).copied().flatten()?;
-            boxes.push((None, slab(&frame, &l.region)));
+            boxes.push((None, slab(&frame, &l.region), Some((frame, l.region.clone()))));
         }
         Some((panels, boxes))
     }

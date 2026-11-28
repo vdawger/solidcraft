@@ -6,7 +6,7 @@
 
 use solidcore_record::{Loop2, Plane, Region2, Vec2, Vec3};
 use solidcraft_develop::prelude::*;
-use solidcraft_develop::{Cut, Development, JointKind, Surface};
+use solidcraft_develop::{Cut, Development, JointKind, Rigid3, Surface};
 use solidcraft_geom::prelude::*;
 use solidcraft_kernel::BoolOp;
 
@@ -167,13 +167,13 @@ impl SurfaceSheet {
             return err(TAB_ADDS_NOTHING);
         }
         // Folded, what the tab adds must stay clear of the sheet's other pieces.
-        let others: Vec<solidcraft_geom::Aabb3> = self
-            .pieces_in_space()
+        let others: Vec<Other> = self
+            .piece_boxes_in_space()
             .map(|(_, boxes)| boxes)
             .unwrap_or_default()
             .into_iter()
-            .filter(|(panel, _)| *panel != Some(i))
-            .map(|(_, b)| b)
+            .filter(|(piece, _, _)| !matches!(piece, Some(Piece::Panel(p)) if *p == i))
+            .map(|(_, b, slab)| (b, slab))
             .collect();
         self.clear_folded(i, &added, &others)?;
         if let Some(p) = self.sheet.panels.get_mut(i) {
@@ -194,9 +194,14 @@ impl SurfaceSheet {
         Ok(())
     }
 
-    /// Folded, `added` (panel `i`'s chart) must stay clear of every box of `others` (the body's
-    /// coordinates).
-    fn clear_folded(&self, i: usize, added: &[Region2], others: &[solidcraft_geom::Aabb3]) -> Result<()> {
+    /// Folded, `added` (panel `i`'s chart) must stay clear of the sheet's `others`. Where its box
+    /// meets another piece's box (the body's coordinates) by more than the allowance across every
+    /// direction, that piece's slab, where it has one, must share no metal with the slab `added`
+    /// makes that spans more than the allowance across every direction (a face on a face shares
+    /// none): two panels' boxes overlap wherever one stands at a slant over the other, however far
+    /// apart their metal (a tab beside a slanted wall, #23742). A bend's zone has only its box,
+    /// and a meeting box refuses the tab.
+    fn clear_folded(&self, i: usize, added: &[Region2], others: &[Other]) -> Result<()> {
         let t = self.thickness;
         let dev = self.develop().map_err(|e| DocError::Invalid(e.to_string()))?;
         let Some(frame) = crate::sheet_surface_cuts::frames(self, &dev)?.get(i).copied().flatten() else { return Ok(()) };
@@ -213,8 +218,28 @@ impl SurfaceSheet {
             let part = |lo: f64, hi: f64, olo: f64, ohi: f64| hi.min(ohi) - lo.max(olo) > shrink;
             part(b.min.x, b.max.x, o.min.x, o.max.x) && part(b.min.y, b.max.y, o.min.y, o.max.y) && part(b.min.z, b.max.z, o.min.z, o.max.z)
         };
-        if others.iter().any(overlaps) {
-            return err(TAB_OVERLAPS);
+        let slab_body = |frame: &Rigid3, regions: &[Region2]| {
+            let plane = Plane::new(frame.shift, frame.x, frame.y).ok_or_else(|| DocError::Invalid(TAB_OVERLAPS.into()))?;
+            Ok::<_, DocError>(solidcraft_kernel::extrude_planar_regions(&plane, regions, 0.0, t)?)
+        };
+        let mut tab = None;
+        for (o, slab) in others {
+            if !overlaps(o) {
+                continue;
+            }
+            let Some((at, own)) = slab else { return err(TAB_OVERLAPS) };
+            let tab = match &mut tab {
+                Some(body) => &*body,
+                None => &*tab.insert(slab_body(&frame, added)?),
+            };
+            let meets = match solidcraft_kernel::boolean(tab, &slab_body(at, std::slice::from_ref(own))?, BoolOp::Intersect) {
+                Ok(None) => false,
+                Ok(Some(common)) => solidcraft_kernel::measure_mass(&common).map_or(true, |m| m.volume > 0.0 && overlaps(&m.bbox)),
+                Err(_) => true,
+            };
+            if meets {
+                return err(TAB_OVERLAPS);
+            }
         }
         Ok(())
     }
@@ -252,13 +277,13 @@ impl SurfaceSheet {
         clear_of(profile, strips.0)?;
         let tiny = 1e-6 * area(std::slice::from_ref(&joined(region, profile)?)).max(1.0);
         let here = dev.placements.get(i).copied().flatten().ok_or_else(|| DocError::Invalid(TAB_OFF_SHEET.into()))?;
-        let others: Vec<solidcraft_geom::Aabb3> = self
+        let others: Vec<Other> = self
             .piece_boxes_in_space()
             .map(|(_, boxes)| boxes)
             .unwrap_or_default()
             .into_iter()
-            .filter(|(piece, _)| !matches!(piece, Some(Piece::Panel(p) | Piece::Tab(_, p)) if *p == i))
-            .map(|(_, b)| b)
+            .filter(|(piece, _, _)| !matches!(piece, Some(Piece::Panel(p) | Piece::Tab(_, p)) if *p == i))
+            .map(|(_, b, slab)| (b, slab))
             .collect();
         let (riding, rest) = riding_with(dev, i)?;
         let before = crate::sheet_surface::planar_union(riding, &mut FlatWork::new())?;
@@ -348,6 +373,10 @@ impl SurfaceSheet {
         self.flat_apart()
     }
 }
+
+/// Another piece of the sheet, folded: a box round it in the body's coordinates, and its slab
+/// where it lies flat on a plane (see [`SurfaceSheet::piece_boxes_in_space`]).
+type Other = (solidcraft_geom::Aabb3, Option<(Rigid3, Region2)>);
 
 /// No part of `profile` lies in `strips`, the strips across its panel's joints (see
 /// [`SurfaceSheet::tab_on`]).
